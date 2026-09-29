@@ -1,0 +1,123 @@
+name: Full GTNH 2.9.0-RC-1 server smoke test
+
+on:
+  push:
+    branches:
+      - test/gtnh-2.9.0-RC-1
+    paths:
+      - .github/workflows/full-rc1-server-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-pack-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out tested ThinkTech version
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Set up Java for GTNH build and runtime
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: |
+            8
+            17
+            21
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+      - name: Build production mod JAR
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace setupCIWorkspace
+          ./gradlew --no-daemon --stacktrace assemble
+          find build/libs -maxdepth 1 -type f -name '*.jar' -printf '%f\n'
+      - name: Download and unpack the *official*, complete GTNH RC-1 server pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p official-pack
+          curl --fail --location --retry 3 --retry-delay 5 \
+            "https://downloads.gtnewhorizons.com/ServerPacks/betas/GT_New_Horizons_2.9.0-RC-1_Server_Java_17-26.zip" \
+            --output /tmp/gtnh-rc1-server.zip
+          unzip -q /tmp/gtnh-rc1-server.zip -d official-pack
+          MOD_DIR="$(find official-pack -type d -name mods -print -quit)"
+          test -n "$MOD_DIR" || { echo 'Official pack has no mods directory'; exit 1; }
+          echo "MOD_DIR=$MOD_DIR" >> "$GITHUB_ENV"
+          echo "PACK_ROOT=$(dirname "$MOD_DIR")" >> "$GITHUB_ENV"
+          echo "Mod count: $(find "$MOD_DIR" -maxdepth 1 -type f -name '*.jar' | wc -l)"
+          find "$MOD_DIR" -maxdepth 1 -type f -iname '*galaxy*' -printf 'Found GalaxySpace-related mod: %f\n'
+      - name: Install tested JAR into real RC-1 mod set
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_JAR="$(find build/libs -maxdepth 1 -type f -name '*.jar' ! -name '*-dev.jar' ! -name '*-sources.jar' -print -quit)"
+          test -s "$TEST_JAR" || { echo 'No production ThinkTech jar'; exit 1; }
+          if find "$MOD_DIR" -maxdepth 1 -type f -iname '*thinktech*' | grep -q .; then
+            echo 'Unexpected duplicate ThinkTech JAR in official pack'; exit 1
+          fi
+          cp "$TEST_JAR" "$MOD_DIR/thinktech-rc1-smoke.jar"
+          echo "Installed: $(basename "$TEST_JAR")"
+          test -n "$(find "$MOD_DIR" -maxdepth 1 -type f -iname '*galaxy*.jar' -print -quit)" || \
+            { echo 'Expected GalaxySpace-related mod missing from official pack'; exit 1; }
+      - name: Start the complete GTNH RC-1 dedicated server
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p diagnostics
+          cd "$PACK_ROOT"
+          printf 'eula=true\n' > eula.txt
+          printf 'online-mode=false\nmax-tick-time=-1\n' > server.properties
+          echo 'Startup scripts found:'
+          find . -maxdepth 2 -type f -iname '*server*.sh' -print
+          SCRIPT="$(find . -maxdepth 2 -type f -name 'startserver-java9.sh' -print -quit)"
+          if [[ -z "$SCRIPT" ]]; then
+            SCRIPT="$(find . -maxdepth 2 -type f -name 'startserver.sh' -print -quit)"
+          fi
+          if [[ -z "$SCRIPT" ]]; then
+            echo 'No supported GTNH server launch script found' | tee server.log
+            exit 1
+          fi
+          echo "Launching $SCRIPT with $(java -version 2>&1 | head -n 1)"
+          timeout --signal=TERM --kill-after=20s 360s bash "$SCRIPT" </dev/null 2>&1 | tee server.log
+          STATUS=${PIPESTATUS[0]}
+          echo "Server launcher exit code: $STATUS"
+          if [[ $STATUS -ne 0 && $STATUS -ne 124 ]]; then exit "$STATUS"; fi
+      - name: Collect diagnostic logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p diagnostics
+          if [[ -n "${PACK_ROOT:-}" ]]; then
+            cp "$PACK_ROOT/server.log" diagnostics/console.log 2>/dev/null || true
+            find "$PACK_ROOT" -maxdepth 3 -type f \
+              \( -name 'fml-server-latest.log' -o -name 'latest.log' \) \
+              -exec cp --backup=numbered '{}' diagnostics/ \; 2>/dev/null || true
+          fi
+      - name: Verify full-pack startup and inspect mod-specific errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -rE 'Done \([0-9.]+s\)! For help' diagnostics/ >/dev/null || \
+            { echo 'Full RC-1 server did not complete startup'; exit 1; }
+          if grep -rEi 'The state engine was in incorrect state ERRORED|Fatal errors were detected|Caught exception from thinktech' diagnostics/; then
+            echo 'Startup contains fatal mod error'; exit 1
+          fi
+          if grep -rEi 'GalaxySpace.*mod is not loaded' diagnostics/; then
+            echo 'GalaxySpace absent even in purported full pack'; exit 1
+          fi
+          echo 'Official RC-1 server reached the Done state with ThinkTech installed.'
+          grep -ri 'ThinkTech' diagnostics/ | tail -n 15 || true
+          echo 'Recipe-related error summary:'
+          grep -riE 'null detected in (item|fluid)|invalid recipe' diagnostics/ | sed -E 's/^.*(null detected in|invalid recipe)/\1/' | sort | uniq -c | head -n 30 || true
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-rc1-server-smoke-logs
+          path: diagnostics/
+          retention-days: 14
