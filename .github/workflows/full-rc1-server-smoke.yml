@@ -28,12 +28,12 @@ jobs:
             8
             17
             21
-            25
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v5
       - name: Build production mod JAR
         run: |
           chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace setupCIWorkspace
           ./gradlew --no-daemon --stacktrace assemble
           find build/libs -maxdepth 1 -type f -name '*.jar' -printf '%f\n'
       - name: Download and unpack the *official*, complete GTNH RC-1 server pack
